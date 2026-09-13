@@ -197,7 +197,7 @@ emit_chains() {
     if [[ -n "$waiting_for" ]] && [[ "$(classify_slug "$waiting_for" | cut -d'|' -f2)" != "$SM_OVERALL_SUCCESS" ]]; then
       waiting_unsatisfied="true"
     fi
-    if chain_merged_on_trunk "$REPO_ROOT" "$phases"; then
+    if chain_merged_on_trunk "$REPO_ROOT" "$branch"; then
       merged_on_trunk="true"
     else
       merged_on_trunk="false"

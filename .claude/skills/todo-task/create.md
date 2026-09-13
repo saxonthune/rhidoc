@@ -1,6 +1,11 @@
 # todo-task: create mode
 
-Quickly file a task so the current session can continue its primary work.
+File a task as a durable markdown note. Two first-class uses:
+
+- **Park work** so the current session can continue its primary task.
+- **Hand off** context to a later session — one session records an intention with enough
+  detail that a different session can triage it, discuss it with the user, and implement
+  it. The inbox draft is shared memory between sessions, not only a note-to-self.
 
 **Input**: everything after `create` is the task description. If empty, ask the user what to file.
 
@@ -41,7 +46,9 @@ Write to `.todo-tasks/inbox/{slug}.md`. The inbox is **gitignored** — a filed 
 
 ## Step 3: Confirm
 
-Tell the user the file was created and they can triage it with `/todo-task triage {slug}`.
+Tell the user the file was created and they (or a later session) can triage it with
+`/todo-task triage {slug}`. If the task is a handoff meant for another session, say so —
+the draft holds until that session reads it.
 
 ## Guidelines
 

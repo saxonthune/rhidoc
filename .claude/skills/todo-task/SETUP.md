@@ -26,7 +26,7 @@ what to allow.
 These three are strictly read-only (`report.sh` is the sole state-reader; `status.sh` and
 `list-pending.sh` are pure renderers over it).
 
-`archive.sh` mutates state — it runs `git rm` and commits — so it is intentionally left out
+`archive.sh` mutates state — it deletes specs and results after copying them — so it is intentionally left out
 of the suggested allowlist. If you want one-keystroke archiving, add it yourself:
 
 ```jsonc

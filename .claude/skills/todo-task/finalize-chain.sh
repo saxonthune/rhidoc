@@ -29,18 +29,14 @@ worktree="$(read_run_field "$run" worktree)"
 branch="$(read_run_field "$run" branch)"
 after="$(read_run_field "$run" waiting_for)"
 
-if ! chain_merged_on_trunk "$REPO_ROOT" "$phases"; then
-  echo "Chain '${name}' does not appear merged on trunk (phase results missing from HEAD)."
+if ! chain_merged_on_trunk "$REPO_ROOT" "$branch"; then
+  echo "Chain '${name}' does not appear merged on trunk (trunk still differs from ${branch})."
   echo "Merge it first, then re-run finalize-chain:"
   echo "  git merge --squash ${branch} && git commit -m 'feat: chain-${name} (agent)'"
   exit 1
 fi
 
 write_chain_definition "${TODO}/chains/${name}.md" "$name" "$phases" "$after"
-git -C "$REPO_ROOT" add "${TODO}/chains/${name}.md"
-if ! git -C "$REPO_ROOT" diff --cached --quiet; then
-  git -C "$REPO_ROOT" commit -m "todotask: chain definition ${name}"
-fi
 
 [[ -n "$worktree" && -d "$worktree" ]] && git worktree remove --force "$worktree" 2>/dev/null || true
 [[ -n "$branch" ]] && git branch -D "$branch" 2>/dev/null || true

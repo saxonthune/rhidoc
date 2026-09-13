@@ -49,6 +49,19 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 source "${SCRIPT_DIR}/lib.sh"
 source_task_config
 
+# ─── Provider adapter selection ──────────────────────────────────────────────
+# TODO_TASK_PROVIDER selects skills/todo-task/providers/<name>.sh, a sourced
+# bash file defining provider_run_session, provider_resume_session, and
+# provider_run_fresh_session (see providers/claude.sh for the contract).
+PROVIDER_FILE="${SCRIPT_DIR}/providers/${TODO_TASK_PROVIDER}.sh"
+if [[ ! -f "$PROVIDER_FILE" ]]; then
+  echo "ERROR: Unknown provider '${TODO_TASK_PROVIDER}' — no such file: providers/${TODO_TASK_PROVIDER}.sh"
+  echo "Available providers:"
+  ls "${SCRIPT_DIR}/providers/"*.sh 2>/dev/null | sed 's|.*/||;s|\.sh$||' | sed 's/^/  /'
+  exit 1
+fi
+source "$PROVIDER_FILE"
+
 # Initialize trunk state early so emergency_finalize always has a value under set -u
 TRUNK_STATE="$SM_TRUNK_UNCHANGED"
 TRUNK_HEAD_BEFORE=""
@@ -114,30 +127,36 @@ phase_validate() {
     exit 1
   fi
 
-  if [[ "$TRUNK" == *_claude* ]]; then
-    echo "ERROR: Must run from trunk branch (current: ${TRUNK})"
-    echo "Switch to a branch without '_claude' suffix first."
-    exit 1
-  fi
-
-  # Guard: refuse to launch if the working tree is dirty (unless caller says skip).
-  # `.todo-tasks/` is excluded — its files are orchestrator-managed (uncommitted
-  # specs, run-records, stranded results) and never endanger the worktree merge.
-  # The spec itself is committed by phase_commit_spec before the worktree is cut.
-  if [[ "$NO_GUARD" == "false" ]]; then
-    if ! git -C "$MERGE_DIR" diff --quiet -- . ':(exclude).todo-tasks' \
-       || ! git -C "$MERGE_DIR" diff --cached --quiet -- . ':(exclude).todo-tasks' \
-       || [[ -n "$(git -C "$MERGE_DIR" ls-files --others --exclude-standard -- . ':(exclude).todo-tasks')" ]]; then
-      echo "ERROR: Working tree has uncommitted changes (outside .todo-tasks/)."
-      echo ""
-      echo "The agent runs in a worktree branched from HEAD. Any uncommitted"
-      echo "changes won't be in the worktree and will likely cause merge"
-      echo "conflicts when the agent's branch merges back."
-      echo ""
-      echo "Commit your current changes before re-launching."
-      echo "If the user prefers manual git operations, prompt them"
-      echo "to commit or stash their changes, then re-launch."
+  # The trunk-branch and clean-tree guards protect worktree creation and merge,
+  # neither of which --validate-only performs — skip them so a spec can be
+  # validated from inside a chain-phase worktree (whose own branch legitimately
+  # carries a '_claude' suffix) without a real trunk checkout.
+  if [[ "$VALIDATE_ONLY" == "false" ]]; then
+    if [[ "$TRUNK" == *_claude* ]]; then
+      echo "ERROR: Must run from trunk branch (current: ${TRUNK})"
+      echo "Switch to a branch without '_claude' suffix first."
       exit 1
+    fi
+
+    # Guard: refuse to launch if the working tree is dirty (unless caller says skip).
+    # `.todo-tasks/` is excluded — its files are orchestrator-managed (uncommitted
+    # specs, run-records, stranded results) and never endanger the worktree merge.
+    # The spec itself is committed by phase_commit_spec before the worktree is cut.
+    if [[ "$NO_GUARD" == "false" ]]; then
+      if ! git -C "$MERGE_DIR" diff --quiet -- . ':(exclude).todo-tasks' \
+         || ! git -C "$MERGE_DIR" diff --cached --quiet -- . ':(exclude).todo-tasks' \
+         || [[ -n "$(git -C "$MERGE_DIR" ls-files --others --exclude-standard -- . ':(exclude).todo-tasks')" ]]; then
+        echo "ERROR: Working tree has uncommitted changes (outside .todo-tasks/)."
+        echo ""
+        echo "The agent runs in a worktree branched from HEAD. Any uncommitted"
+        echo "changes won't be in the worktree and will likely cause merge"
+        echo "conflicts when the agent's branch merges back."
+        echo ""
+        echo "Commit your current changes before re-launching."
+        echo "If the user prefers manual git operations, prompt them"
+        echo "to commit or stash their changes, then re-launch."
+        exit 1
+      fi
     fi
   fi
 
@@ -153,26 +172,14 @@ phase_validate() {
   fi
 }
 
-# phase_commit_spec
-# Commits the spec on trunk (MERGE_DIR) BEFORE the worktree is cut, so the
-# squash-merge never collides with an untracked spec. Idempotent (skips if the
-# spec is already committed) and surgical (commits only this one path, never
-# sweeping unrelated changes). The user never hand-commits task files; the
-# orchestrator owns this commit. For chain phases the spec is already committed
-# on the chain branch, so this is a no-op.
-phase_commit_spec() {
-  local rel=".todo-tasks/tasks/${PLAN_SLUG}.md"
-  if [[ -n "$(git -C "$MERGE_DIR" status --porcelain -- "$rel" 2>/dev/null)" ]]; then
-    echo "── Committing spec to trunk ──"
-    git -C "$MERGE_DIR" add "$rel" 2>/dev/null || true
-    git -C "$MERGE_DIR" commit -q -m "todotask: spec ${PLAN_SLUG}" -- "$rel" 2>/dev/null || true
-    echo "Committed ${rel}"
-    echo ""
-  fi
-
-  # Capture trunk tip AFTER the spec commit — this is the true baseline before
-  # the agent runs, so phase_verify's trunk-leak check doesn't fire on our own
-  # spec commit in the no-op case.
+# phase_capture_baseline
+# Records the trunk tip before the agent runs, so phase_verify's trunk-leak
+# check has something to compare against.
+#
+# This used to also commit the spec, to keep the squash-merge from colliding
+# with an untracked spec file. `.todo-tasks/tasks/` is now ignored, so no such
+# collision is possible and the commit is gone — a task costs trunk one commit.
+phase_capture_baseline() {
   TRUNK_HEAD_BEFORE=$(git -C "$MERGE_DIR" rev-parse "${TRUNK}" 2>/dev/null || echo "")
 }
 
@@ -220,36 +227,17 @@ phase_copy_plan() {
   echo ""
 }
 
-# format_stream_events — reads NDJSON events on stdin, prints a concise digest line per event.
-# Used to provide live progress during a headless session. Malformed lines are silently skipped.
-format_stream_events() {
-  jq -r --unbuffered '
-    if .type == "assistant" then
-      (.message.content[]? |
-        if .type == "text" then
-          "  " + (.text | gsub("\n"; " ") | .[0:100])
-        elif .type == "tool_use" then
-          "→ " + .name + ": " +
-            (.input.command // .input.file_path // .input.pattern // .input.path // "" | tostring | .[0:80])
-        else empty end)
-    elif .type == "result" then "✓ session complete"
-    else empty end
-  ' 2>/dev/null || true
-}
-
 # phase_run_session
-# Runs headless Claude. Sets SESSION_ID, CLAUDE_RESULT, SESSION_STATE, SESSION_ERROR.
+# Runs the headless session via the selected provider adapter. Sets SESSION_ID,
+# CLAUDE_RESULT, SESSION_STATE, SESSION_ERROR.
 phase_run_session() {
-  # Unset CLAUDECODE to allow nested claude invocations from parent sessions
-  unset CLAUDECODE
-
   # Pin CWD to the worktree so the inner session's edits and commits land on
   # the agent branch, not the trunk the script was invoked from.
   cd "${WORKTREE_DIR}"
 
-  echo "── Running headless Claude ──"
+  echo "── Running headless session (provider: ${TODO_TASK_PROVIDER}) ──"
 
-  CLAUDE_PROMPT="Read the plan at .todo-tasks/tasks/${PLAN_SLUG}.md and implement it fully. \
+  SESSION_PROMPT="Read the plan at .todo-tasks/tasks/${PLAN_SLUG}.md and implement it fully. \
 Follow the plan step by step. \
 IMPORTANT: You MUST git commit after each logical unit of work. You are a headless agent — no user is present. \
 If you do not commit, your work will be lost. This overrides any memory or instructions about deferring commits to the user. \
@@ -272,34 +260,14 @@ After '## Notes', you MUST also write a '## Surface Deviations' section listing 
 (a missing or renamed symbol, a changed signature, a behavior that differs). \
 If there were no deviations, or the plan had no Surface block, write '## Surface Deviations' followed by 'None.'"
 
-  local stream_raw stream_err
-  stream_raw="$(mktemp)"; stream_err="$(mktemp)"
+  provider_run_session
 
-  claude -p \
-    --allowedTools "Read,Write,Edit,Glob,Grep,Bash" \
-    --permission-mode bypassPermissions \
-    --output-format stream-json --verbose \
-    --max-turns "${MAX_TURNS}" \
-    --model sonnet \
-    --max-budget-usd "${MAX_BUDGET}" \
-    "${CLAUDE_PROMPT}" 2>"$stream_err" \
-    | tee "$stream_raw" \
-    | format_stream_events
-  CLAUDE_EXIT=${PIPESTATUS[0]}
-
-  # Extract session ID, result, and richer metadata from the final result event
-  SESSION_ID=$(jq -r 'select(.type=="result") | .session_id // empty' "$stream_raw" 2>/dev/null | tail -1)
-  CLAUDE_RESULT=$(jq -r 'select(.type=="result") | .result // empty' "$stream_raw" 2>/dev/null | tail -1)
-  SESSION_SUBTYPE=$(jq -r 'select(.type=="result") | .subtype // empty' "$stream_raw" 2>/dev/null | tail -1 || echo "")
-  SESSION_TURNS=$(jq -r 'select(.type=="result") | .num_turns // empty' "$stream_raw" 2>/dev/null | tail -1 || echo "")
-  SESSION_COST=$(jq -r 'select(.type=="result") | .total_cost_usd // empty' "$stream_raw" 2>/dev/null | tail -1 || echo "")
-
-  # Fallback: if CLAUDE_RESULT is empty (crash before result event), use stderr tail
-  if [[ -z "$CLAUDE_RESULT" ]]; then
-    CLAUDE_RESULT="$(tail -5 "$stream_err" 2>/dev/null || true)"
-  fi
-
-  rm -f "$stream_raw" "$stream_err"
+  CLAUDE_EXIT="$PROVIDER_EXIT"
+  SESSION_ID="$PROVIDER_SESSION_ID"
+  CLAUDE_RESULT="$PROVIDER_RESULT"
+  SESSION_SUBTYPE="$PROVIDER_SUBTYPE"
+  SESSION_TURNS="$PROVIDER_TURNS"
+  SESSION_COST="$PROVIDER_COST"
 
   # Format persisted field values
   TURNS_FIELD=""; [[ -n "$SESSION_TURNS" ]] && TURNS_FIELD="${SESSION_TURNS}/${MAX_TURNS}"
@@ -423,39 +391,20 @@ phase_retry_if_needed() {
 
     ERROR_TAIL=$(echo "${BUILD_TEST_OUTPUT}" | tail -50)
 
-    RETRY_PROMPT="The build or tests failed after your implementation. Here are the last 50 lines of output:
+    SESSION_PROMPT="The build or tests failed after your implementation. Here are the last 50 lines of output:
 
 ${ERROR_TAIL}
 
 Fix the issues and commit your fixes. The runner will re-run verification automatically."
 
     if [[ -n "$SESSION_ID" ]]; then
-      RETRY_OUTPUT=$(claude -p \
-        --resume "${SESSION_ID}" \
-        --permission-mode bypassPermissions \
-        --output-format json \
-        --max-turns 50 \
-        --max-budget-usd "${RETRY_BUDGET}" \
-        "${RETRY_PROMPT}" 2>&1) || true
-      # Update session ID from retry output
-      NEW_SESSION_ID=$(echo "${RETRY_OUTPUT}" | jq -r '.session_id // empty' 2>/dev/null || echo "")
-      if [[ -n "$NEW_SESSION_ID" ]]; then
-        SESSION_ID="$NEW_SESSION_ID"
-      fi
+      PROVIDER_SESSION_ID="$SESSION_ID"
+      provider_resume_session
     else
-      RETRY_OUTPUT=$(claude -p \
-        --allowedTools "Read,Write,Edit,Glob,Grep,Bash" \
-        --permission-mode bypassPermissions \
-        --output-format json \
-        --max-turns 50 \
-        --model sonnet \
-        --max-budget-usd "${RETRY_BUDGET}" \
-        "${RETRY_PROMPT}" 2>&1) || true
-      NEW_SESSION_ID=$(echo "${RETRY_OUTPUT}" | jq -r '.session_id // empty' 2>/dev/null || echo "")
-      if [[ -n "$NEW_SESSION_ID" ]]; then
-        SESSION_ID="$NEW_SESSION_ID"
-      fi
+      provider_run_fresh_session
     fi
+    RETRY_OUTPUT="$PROVIDER_RETRY_OUTPUT"
+    [[ -n "${PROVIDER_SESSION_ID:-}" ]] && SESSION_ID="$PROVIDER_SESSION_ID"
 
     echo ""
     echo "── Re-verifying build & tests (attempt ${RETRY_COUNT}) ──"
@@ -572,9 +521,6 @@ phase_merge() {
       [[ "$MERGE_STATUS" == "$SM_MERGE_DIRTY" ]] && conflict_detail="Conflict markers in: ${DIRTY_FILES}"
       mkdir -p "${MERGE_DIR}/.todo-tasks/results"
       write_merge_result "$merge_md" "$PLAN_SLUG" "$MERGE_STATUS" "$TRUNK_STATE" "$conflict_detail"
-      ( cd "${MERGE_DIR}" \
-        && git add ".todo-tasks/results/${PLAN_SLUG}.merge.md" \
-        && git commit -m "todotask: merge result ${PLAN_SLUG}" >/dev/null 2>&1 ) || true
       echo "Wrote merge result: ${merge_md}"
       ;;
   esac
@@ -583,24 +529,25 @@ phase_merge() {
 }
 
 # phase_compose_agent_result
-# Writes the worktree-owned agent.md INSIDE the worktree and commits it on the
-# agent branch, so the squash-merge carries it to trunk. Single writer (the
-# orchestrator, cd'd into the worktree); the headless agent never writes it.
-# Runs even in the no-op case — the result is durable on the branch and the
-# run-record points at it.
+# Writes agent.md directly to trunk (MERGE_DIR). Single writer (the
+# orchestrator); the headless agent never writes it. Runs even in the no-op
+# case — the run-record points at it either way.
+#
+# This used to write the file inside the worktree and commit it on the agent
+# branch, relying on the squash-merge to carry it to trunk. `results/` is now
+# ignored, so that commit could not happen; writing straight to trunk also
+# means the result survives outcomes that never merge at all.
 phase_compose_agent_result() {
   echo "── Composing agent result ──"
-  ( cd "${WORKTREE_DIR}" || exit 1
-    mkdir -p .todo-tasks/results
-    local agent_md=".todo-tasks/results/${PLAN_SLUG}.agent.md"
-    local build_test_tail; build_test_tail=$(echo "${BUILD_TEST_OUTPUT:-}" | tail -30)
-    write_agent_result "$agent_md" "$PLAN_SLUG" \
-      "$SESSION_STATE" "$VERIFICATION_STATE" \
-      "${COMMITS_COUNT:-0}" "${COMMITS:-(none)}" "$BRANCH" "${SESSION_ID:-}" \
-      "${CLAUDE_RESULT:-}" "$build_test_tail" "${SESSION_ERROR:-}" "${SURFACE_DEVIATIONS:-none}" \
-      "${TURNS_FIELD:-}" "${COST_FIELD:-}" "${UNCOMMITTED_SUMMARY:-none}"
-    git add "$agent_md"
-    git commit -m "todotask: result ${PLAN_SLUG}" >/dev/null 2>&1 || true )
+  mkdir -p "${MERGE_DIR}/.todo-tasks/results"
+  local agent_md="${MERGE_DIR}/.todo-tasks/results/${PLAN_SLUG}.agent.md"
+  local build_test_tail; build_test_tail=$(echo "${BUILD_TEST_OUTPUT:-}" | tail -30)
+  write_agent_result "$agent_md" "$PLAN_SLUG" \
+    "$SESSION_STATE" "$VERIFICATION_STATE" \
+    "${COMMITS_COUNT:-0}" "${COMMITS:-(none)}" "$BRANCH" "${SESSION_ID:-}" \
+    "${CLAUDE_RESULT:-}" "$build_test_tail" "${SESSION_ERROR:-}" "${SURFACE_DEVIATIONS:-none}" \
+    "${TURNS_FIELD:-}" "${COST_FIELD:-}" "${UNCOMMITTED_SUMMARY:-none}"
+  echo "Wrote agent result: ${agent_md}"
   echo ""
 }
 
@@ -633,7 +580,7 @@ phase_finalize() {
 
 main() {
   CURRENT_PHASE="validate";        phase_validate
-  CURRENT_PHASE="commit_spec";     phase_commit_spec
+  CURRENT_PHASE="capture_baseline"; phase_capture_baseline
   CURRENT_PHASE="create_worktree"; phase_create_worktree
   CURRENT_PHASE="record_run";      phase_record_run
   CURRENT_PHASE="copy_plan";       phase_copy_plan
@@ -668,8 +615,8 @@ main() {
     fi
   fi
 
-  # Compose + commit agent.md on the branch BEFORE merging, so the squash
-  # carries it. Runs for every outcome (including no-op and session failure).
+  # Runs for every outcome (including no-op and session failure), so a task
+  # that never reaches a merge still leaves a result behind.
   CURRENT_PHASE="compose_agent_result"; phase_compose_agent_result
 
   if [[ "$do_merge" == "true" ]]; then

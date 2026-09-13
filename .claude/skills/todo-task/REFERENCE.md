@@ -14,16 +14,21 @@ never lifecycle states.
 ```
 .todo-tasks/
   inbox/{slug}.md            IGNORED   untriaged draft — written by create, local-only
-  tasks/{slug}.md            TRACKED   spec — promoted by triage; committed by the orchestrator at launch
-  results/{slug}.agent.md    TRACKED   worktree-owned outcome — carried to trunk by the merge
-  results/{slug}.merge.md    TRACKED   trunk-owned outcome — written on trunk after the merge
-  chains/{chain}.md          TRACKED   chain definition — written on trunk at completion
+  tasks/{slug}.md            IGNORED   spec — promoted by triage; copied into each worktree
+  results/{slug}.agent.md    IGNORED   agent outcome — written on trunk by the orchestrator
+  results/{slug}.merge.md    IGNORED   merge outcome — written on trunk after the merge
+  chains/{chain}.md          IGNORED   chain definition — written on trunk at completion
   epics/{epic}.md            TRACKED   epic definition with `members: a,b,c`
   task-config.sh             TRACKED   build/test commands
   .running/{slug}.run        IGNORED   run-record — liveness (pid) + worktree location
-  .archived/                 IGNORED   physical copies after `git rm`
+  .archived/                 IGNORED   physical copies made at archive time
   *.log .version             IGNORED
 ```
+
+Only `epics/` and `task-config.sh` are tracked. Everything a run produces is
+ignored, so a task costs trunk **exactly one commit**: the squash-merge of the
+agent's work. Specs and results are still durable on disk and in `.archived/`;
+they simply never enter git history.
 
 Phase is computed by the reporter from file presence:
 
@@ -35,13 +40,33 @@ Phase is computed by the reporter from file presence:
 | run-record + dead PID + no `merge.md` | crashed (result read from the worktree) |
 | `agent.md` + `merge.md` | done (classified success/failure) |
 
-The spec being uncommitted does not block launching — the dirty-tree guard ignores
-`.todo-tasks/`, and `execute-plan.sh` commits the spec to trunk before cutting the worktree
-(so the squash-merge never collides with an untracked spec). You never hand-commit task files.
+### In-session implementation (no run)
+
+A spec does not have to go to a headless run. A session — the one that triaged it, or a
+later one that picked it up — can implement the plan directly in the conversation. There
+is no run-record and no `results/` file, so the reporter keeps classifying the spec as
+`pending` until it is archived. The sanctioned close-out is:
+
+```bash
+bash .claude/skills/todo-task/archive.sh --merged {slug}
+```
+
+`--merged` means "the operator asserts this work reached trunk." It takes any non-running
+task, including a spec that never ran, and archives it as a success. Commit the actual
+work first (the user does this); an in-session implementation carries no separate spec
+commit, and the one-commit-per-task guarantee is specific to the headless route — a hand
+implementation commits however the user wants.
+
+### Spec-to-git rule
+
+The spec never enters git. `execute-plan.sh` copies it into the agent's worktree, and
+`execute-chain.sh` copies every phase spec into the chain worktree, because `git worktree
+add` gives a fresh checkout that carries no ignored files. The path is ignored inside the
+worktree too, so an agent cannot commit a spec even by accident.
 
 `report.sh` is the **only** component that walks the filesystem and classifies state.
 `status.sh`, `monitor.sh`, and `list-pending.sh` are pure renderers over its TSV output.
-`archive.sh` is the **only** component that moves files (via `git rm`).
+`archive.sh` is the **only** component that removes files.
 
 ## Manual Merge Conflict Resolution
 
@@ -93,8 +118,9 @@ are skipped and only the final chain→trunk merge is re-attempted — no manual
 - `create` only writes `inbox/{slug}.md` (gitignored draft). Never commit it.
 - `triage` promotes the draft → `tasks/{slug}.md` and deletes the inbox draft (and may add a slug to an epic's `members:` list). Do not commit the spec — the orchestrator commits it at launch.
 - `execute` launches agents via shell scripts; it never moves files between directories.
-- **Never hand-commit task specs** — `execute-plan.sh`/`execute-chain.sh` commit them automatically before cutting the worktree.
+- A spec implemented **in-session** is closed with `archive.sh --merged {slug}` once the user has committed the work — same exit as a hand-finished run.
+- **Never hand-commit task specs** — `execute-plan.sh`/`execute-chain.sh` commit them automatically before cutting the worktree. An in-session implementation never commits the spec at all; the user commits the work.
 - **Never hand-edit `results/*.agent.md`** — it is worktree-owned and carried by the merge.
 - **Never write to `.running/`** — the run-record is the orchestrator's; the reporter only reads it.
-- **Never hand-move files** to archive — run `archive.sh` (it uses `git rm`).
+- **Never hand-move files** to archive — run `archive.sh` (it copies to `.archived/`, then removes).
 - **After manually resolving a merge conflict, always clean up** (remove worktree, delete branch, `archive.sh {slug}`).

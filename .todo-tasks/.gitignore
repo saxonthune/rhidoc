@@ -1,5 +1,9 @@
 inbox/
 .running/
+.done/
 .archived/
+tasks/
+results/
+chains/
 *.log
 .version
